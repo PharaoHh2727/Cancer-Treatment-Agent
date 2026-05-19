@@ -1,0 +1,17 @@
+.env
+runtime_data
+api_runtime
+results
+results*
+outputs
+frontend/node_modules
+frontend/dist
+node_modules
+dist
+build
+**/__pycache__
+**/*.pyc
+*.log
+*.svs
+*.tif
+*.tiff

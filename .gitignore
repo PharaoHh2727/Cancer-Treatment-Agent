@@ -1,0 +1,36 @@
+.env
+.env.local
+.env.*.local
+
+runtime_data/
+api_runtime/
+results/
+results*/
+outputs/
+
+frontend/node_modules/
+frontend/dist/
+
+node_modules/
+dist/
+build/
+
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+*.log
+*.tmp
+*.svs
+*.tif
+*.tiff
+
+# Large assets are often distributed outside git or via Git LFS.
+# Uncomment these lines if you do not want to commit model and guideline assets.
+# CSCO/*.pdf
+# chroma_db/
+# transmil_tnm/results/
+# cmta_survival/results/
+# gene_data/

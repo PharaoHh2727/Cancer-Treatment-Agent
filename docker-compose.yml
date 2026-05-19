@@ -1,0 +1,33 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file:
+      - .env
+    environment:
+      MEDICAL_AGENT_ROOT: /app
+      MEDICAL_AGENT_DATA_DIR: /app/runtime_data
+      CLAM_DIR: /app/CLAM-master
+      CLAM_PYTHON: python
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./runtime_data:/app/runtime_data
+      - ./CSCO:/app/CSCO
+      - ./chroma_db:/app/chroma_db
+      - ./transmil_tnm/results:/app/transmil_tnm/results
+      - ./cmta_survival/results:/app/cmta_survival/results
+      - ./gene_data:/app/gene_data
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      VITE_MEDICAL_AGENT_API_BASE_URL: ""
+      VITE_PROXY_API_TARGET: http://backend:8000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
