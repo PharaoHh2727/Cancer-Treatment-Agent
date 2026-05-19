@@ -78,8 +78,6 @@ http://127.0.0.1:8000/docs
 
 手动安装时需要系统已安装 OpenSlide。Linux 可使用 `apt install openslide-tools libopenslide0`，Windows 建议优先使用 Docker，或自行安装 OpenSlide Windows 运行库并加入 `PATH`。
 
-后端：
-
 ```text
 cd 项目目录/backend
 先安装后端依赖：pip install -r requirements.txt
