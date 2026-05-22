@@ -133,6 +133,8 @@ class CMSurvivalPredictor:
         return_attention: bool = False,
         pathomics_coords: np.ndarray | None = None,
         pathomics_patch_size: int | None = None,
+        pathomics_background_path: str | None = None,
+        pathomics_level_dim: tuple[int, int] | list[int] | np.ndarray | None = None,
         attention_output_dir: str | None = None,
     ) -> Dict[str, Any]:
         if pathomics_features is None:
@@ -215,6 +217,8 @@ class CMSurvivalPredictor:
                     n_path_tokens=pathomics_features.shape[0],
                     pathomics_coords=pathomics_coords,
                     pathomics_patch_size=pathomics_patch_size,
+                    pathomics_background_path=pathomics_background_path,
+                    pathomics_level_dim=pathomics_level_dim,
                     attention_output_dir=attention_output_dir,
                     slide_id=slide_id,
                 )
@@ -618,6 +622,162 @@ class CMSurvivalPredictor:
         with open(path, "wb") as handle:
             handle.write(png)
 
+    def _read_simple_png_rgb(self, path: Path) -> np.ndarray:
+        import struct
+        import zlib
+
+        data = Path(path).read_bytes()
+        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("not a PNG file")
+
+        offset = 8
+        width = height = None
+        compressed = b""
+        while offset < len(data):
+            length = struct.unpack(">I", data[offset:offset + 4])[0]
+            tag = data[offset + 4:offset + 8]
+            payload = data[offset + 8:offset + 8 + length]
+            offset += 12 + length
+            if tag == b"IHDR":
+                width, height, bit_depth, color_type, _, _, interlace = struct.unpack(">IIBBBBB", payload)
+                if bit_depth != 8 or color_type != 2 or interlace != 0:
+                    raise ValueError("unsupported PNG format")
+            elif tag == b"IDAT":
+                compressed += payload
+            elif tag == b"IEND":
+                break
+
+        if width is None or height is None:
+            raise ValueError("missing PNG header")
+
+        raw = zlib.decompress(compressed)
+        rows = []
+        stride = width * 3
+        position = 0
+        for _ in range(height):
+            filter_type = raw[position]
+            position += 1
+            if filter_type != 0:
+                raise ValueError("unsupported PNG filter")
+            rows.append(np.frombuffer(raw[position:position + stride], dtype=np.uint8).reshape(width, 3))
+            position += stride
+        return np.stack(rows, axis=0).copy()
+
+    def _load_heatmap_background(self, background_path: str | None) -> np.ndarray | None:
+        if not background_path:
+            return None
+        path = Path(background_path)
+        if not path.exists():
+            print(f"  [CMTA attention] Heatmap background not found: {path}")
+            return None
+
+        try:
+            from PIL import Image
+
+            return np.asarray(Image.open(path).convert("RGB"), dtype=np.uint8)
+        except Exception:
+            pass
+
+        try:
+            import cv2
+
+            image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if image is not None:
+                return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        except Exception:
+            pass
+
+        if path.suffix.lower() == ".png":
+            try:
+                return self._read_simple_png_rgb(path)
+            except Exception as exc:
+                print(f"  [CMTA attention] Failed to load PNG heatmap background {path}: {exc}")
+                return None
+
+        print(f"  [CMTA attention] Failed to load heatmap background: {path}")
+        return None
+
+    def _coerce_level_dim(self, level_dim: tuple[int, int] | list[int] | np.ndarray | None) -> tuple[int, int] | None:
+        if level_dim is None:
+            return None
+        try:
+            array = np.asarray(level_dim).reshape(-1)
+            if array.size < 2:
+                return None
+            width = int(array[0])
+            height = int(array[1])
+            if width <= 0 or height <= 0:
+                return None
+            return width, height
+        except Exception:
+            return None
+
+    def _prepare_heatmap_canvas(
+        self,
+        coords: np.ndarray,
+        patch_size: int,
+        background_path: str | None,
+        level_dim: tuple[int, int] | list[int] | np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray, int, int, dict[str, Any]]:
+        level_dim = self._coerce_level_dim(level_dim)
+        background = self._load_heatmap_background(background_path)
+        if background is not None and level_dim is not None:
+            canvas = np.asarray(background, dtype=np.uint8).copy()
+            canvas_h, canvas_w = canvas.shape[:2]
+            scale_x = canvas_w / max(float(level_dim[0]), 1.0)
+            scale_y = canvas_h / max(float(level_dim[1]), 1.0)
+            draw_coords = coords.copy()
+            draw_coords[:, 0] = draw_coords[:, 0] * scale_x
+            draw_coords[:, 1] = draw_coords[:, 1] * scale_y
+            patch_w = max(1, int(np.ceil(patch_size * scale_x)))
+            patch_h = max(1, int(np.ceil(patch_size * scale_y)))
+            metadata = {
+                "background_loaded": True,
+                "used_background": True,
+                "level_dim": [int(level_dim[0]), int(level_dim[1])],
+                "canvas_shape": [int(canvas_h), int(canvas_w)],
+                "fallback_reason": None,
+            }
+            return canvas, draw_coords, patch_w, patch_h, metadata
+
+        if background is not None:
+            canvas = np.asarray(background, dtype=np.uint8).copy()
+            canvas_h, canvas_w = canvas.shape[:2]
+            extent = coords.max(axis=0) + patch_size
+            scale_x = canvas_w / max(float(extent[0]), 1.0)
+            scale_y = canvas_h / max(float(extent[1]), 1.0)
+            draw_coords = coords.copy()
+            draw_coords[:, 0] = draw_coords[:, 0] * scale_x
+            draw_coords[:, 1] = draw_coords[:, 1] * scale_y
+            patch_w = max(1, int(np.ceil(patch_size * scale_x)))
+            patch_h = max(1, int(np.ceil(patch_size * scale_y)))
+            metadata = {
+                "background_loaded": True,
+                "used_background": True,
+                "level_dim": None,
+                "canvas_shape": [int(canvas_h), int(canvas_w)],
+                "fallback_reason": "missing_level_dim_used_coord_extent",
+            }
+            return canvas, draw_coords, patch_w, patch_h, metadata
+
+        min_xy = coords.min(axis=0)
+        shifted_coords = coords - min_xy.reshape(1, 2)
+        extent = shifted_coords.max(axis=0) + patch_size
+        max_dimension = 1800
+        scale = min(max_dimension / max(float(extent[0]), 1.0), max_dimension / max(float(extent[1]), 1.0), 1.0)
+        canvas_w = max(1, int(np.ceil(float(extent[0]) * scale)))
+        canvas_h = max(1, int(np.ceil(float(extent[1]) * scale)))
+        patch_px = max(1, int(np.ceil(patch_size * scale)))
+        canvas = np.full((canvas_h, canvas_w, 3), 255, dtype=np.uint8)
+        metadata = {
+            "background_loaded": False,
+            "used_background": False,
+            "level_dim": [int(level_dim[0]), int(level_dim[1])] if level_dim is not None else None,
+            "canvas_shape": [int(canvas_h), int(canvas_w)],
+            "fallback_reason": "background_load_failed" if background_path else "missing_background_path",
+        }
+        return canvas, shifted_coords * scale, patch_px, patch_px, metadata
+
     def _render_omic_patch_heatmaps(
         self,
         g_in_p_att: np.ndarray,
@@ -625,6 +785,8 @@ class CMSurvivalPredictor:
         output_dir: Path,
         slide_id: str,
         patch_size: int | None,
+        background_path: str | None = None,
+        level_dim: tuple[int, int] | list[int] | np.ndarray | None = None,
     ) -> list[str]:
         coords = np.asarray(coords, dtype=np.float32)
         if coords.ndim != 2 or coords.shape[1] < 2:
@@ -640,14 +802,14 @@ class CMSurvivalPredictor:
 
         output_dir.mkdir(parents=True, exist_ok=True)
         patch_size = int(patch_size or 256)
-        min_xy = coords.min(axis=0)
-        coords = coords - min_xy.reshape(1, 2)
-        extent = coords.max(axis=0) + patch_size
-        max_dimension = 1800
-        scale = min(max_dimension / max(float(extent[0]), 1.0), max_dimension / max(float(extent[1]), 1.0), 1.0)
-        canvas_w = max(1, int(np.ceil(float(extent[0]) * scale)))
-        canvas_h = max(1, int(np.ceil(float(extent[1]) * scale)))
-        patch_px = max(1, int(np.ceil(patch_size * scale)))
+        base_canvas, draw_coords, patch_w, patch_h, canvas_metadata = self._prepare_heatmap_canvas(
+            coords=coords,
+            patch_size=patch_size,
+            background_path=background_path,
+            level_dim=level_dim,
+        )
+        self._last_heatmap_canvas_metadata = canvas_metadata
+        canvas_h, canvas_w = base_canvas.shape[:2]
         labels = self._get_omic_group_labels()
         safe_slide_id = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(slide_id or "slide"))
 
@@ -655,21 +817,25 @@ class CMSurvivalPredictor:
         for omic_idx, weights in enumerate(g_in_p_att[:6]):
             weights = np.asarray(weights, dtype=np.float32)
             rank_heat_values = self._rank_heat_values(weights)
-            canvas = np.full((canvas_h, canvas_w, 3), 255, dtype=np.uint8)
+            canvas = base_canvas.copy()
             order = np.argsort(rank_heat_values)
             for patch_idx in order:
-                x = int(round(float(coords[patch_idx, 0]) * scale))
-                y = int(round(float(coords[patch_idx, 1]) * scale))
-                x2 = min(canvas_w - 1, x + patch_px)
-                y2 = min(canvas_h - 1, y + patch_px)
+                x = int(round(float(draw_coords[patch_idx, 0])))
+                y = int(round(float(draw_coords[patch_idx, 1])))
+                x_start = max(0, x)
+                y_start = max(0, y)
+                x2 = min(canvas_w - 1, x + patch_w)
+                y2 = min(canvas_h - 1, y + patch_h)
+                if x2 < x_start or y2 < y_start:
+                    continue
                 heat_value = float(rank_heat_values[patch_idx])
                 color = self._rank_heat_rgb(heat_value)
                 alpha = 0.20 + 0.80 * heat_value
-                roi = canvas[y:y2 + 1, x:x2 + 1]
+                roi = canvas[y_start:y2 + 1, x_start:x2 + 1]
                 if roi.size == 0:
                     continue
                 blended = (roi.astype(np.float32) * (1.0 - alpha) + color.reshape(1, 1, 3) * alpha).astype(np.uint8)
-                canvas[y:y2 + 1, x:x2 + 1] = blended
+                canvas[y_start:y2 + 1, x_start:x2 + 1] = blended
 
             omic_label = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in labels[omic_idx])
             heatmap_path = output_dir / f"{safe_slide_id}_omic{omic_idx + 1}_{omic_label}_g_in_p_heatmap.png"
@@ -723,6 +889,8 @@ class CMSurvivalPredictor:
         n_path_tokens: int,
         pathomics_coords: np.ndarray | None,
         pathomics_patch_size: int | None,
+        pathomics_background_path: str | None,
+        pathomics_level_dim: tuple[int, int] | list[int] | np.ndarray | None,
         attention_output_dir: str | None,
         slide_id: str | None,
     ) -> dict[str, Any]:
@@ -744,6 +912,14 @@ class CMSurvivalPredictor:
 
         coords_array = None
         heatmap_paths: list[str] = []
+        coerced_level_dim = self._coerce_level_dim(pathomics_level_dim)
+        heatmap_canvas_metadata = {
+            "background_loaded": False,
+            "used_background": False,
+            "level_dim": [int(coerced_level_dim[0]), int(coerced_level_dim[1])] if coerced_level_dim is not None else None,
+            "canvas_shape": None,
+            "fallback_reason": "heatmaps_not_rendered",
+        }
         if pathomics_coords is not None:
             coords_array = np.asarray(pathomics_coords)
             if coords_array.ndim == 2 and coords_array.shape[0] >= n_path_tokens:
@@ -754,7 +930,10 @@ class CMSurvivalPredictor:
                     output_dir=output_dir,
                     slide_id=slide_id or "slide",
                     patch_size=pathomics_patch_size,
+                    background_path=pathomics_background_path,
+                    level_dim=pathomics_level_dim,
                 )
+                heatmap_canvas_metadata = getattr(self, "_last_heatmap_canvas_metadata", heatmap_canvas_metadata)
             else:
                 print(
                     "  [CMTA attention] Coords are missing or shorter than sampled path tokens, "
@@ -781,6 +960,12 @@ class CMSurvivalPredictor:
                 "genes": top_omic_genes,
             },
             "g_in_p_heatmaps": heatmap_paths,
+            "heatmap_background": pathomics_background_path,
+            "heatmap_level_dim": heatmap_canvas_metadata.get("level_dim"),
+            "heatmap_background_loaded": heatmap_canvas_metadata.get("background_loaded", False),
+            "heatmap_used_background": heatmap_canvas_metadata.get("used_background", False),
+            "heatmap_fallback_reason": heatmap_canvas_metadata.get("fallback_reason"),
+            "heatmap_canvas_shape": heatmap_canvas_metadata.get("canvas_shape"),
             "g_in_p_attention_csv": str(g_in_p_attention_csv),
             "attention_npz": str(attention_npz),
         }
@@ -874,6 +1059,8 @@ def predict_survival(
     return_attention: bool = False,
     pathomics_coords: np.ndarray | None = None,
     pathomics_patch_size: int | None = None,
+    pathomics_background_path: str | None = None,
+    pathomics_level_dim: tuple[int, int] | list[int] | np.ndarray | None = None,
     attention_output_dir: str | None = None,
 ) -> Dict[str, Any]:
     if isinstance(pathomics_features, str):
@@ -897,6 +1084,8 @@ def predict_survival(
         return_attention=return_attention,
         pathomics_coords=pathomics_coords,
         pathomics_patch_size=pathomics_patch_size,
+        pathomics_background_path=pathomics_background_path,
+        pathomics_level_dim=pathomics_level_dim,
         attention_output_dir=attention_output_dir,
     )
 

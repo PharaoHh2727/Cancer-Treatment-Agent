@@ -1014,6 +1014,12 @@ function filePathToSessionUrl(path: string, activeSessionId: string | null) {
   return absoluteApiUrl(`/api/files/${activeSessionId}/${encodePathSegments(relativePath)}`);
 }
 
+function withCacheBuster(url: string, cacheKey?: string) {
+  if (!url || !cacheKey) return url;
+  const separator = url.includes("?") ? "&" : "?";
+  return `${url}${separator}v=${encodeURIComponent(cacheKey)}`;
+}
+
 function getFileNameFromPath(path: string) {
   const parts = path.replace(/\\/g, "/").split("/");
   return parts[parts.length - 1] || path;
@@ -1435,13 +1441,15 @@ function createHeatmapItem(
   label: string,
   path: string,
   activeSessionId: string | null,
-  mode?: string
+  mode?: string,
+  cacheKey?: string
 ): HeatmapItem {
   const sourcePath = normalizeExtractedPath(path);
+  const url = filePathToSessionUrl(sourcePath, activeSessionId);
   return {
     label,
     sourcePath,
-    url: filePathToSessionUrl(sourcePath, activeSessionId),
+    url: withCacheBuster(url, cacheKey),
     mode,
     description: describeTransmilScoreMode(mode)
   };
@@ -1453,7 +1461,11 @@ function appendHeatmapItem(items: HeatmapItem[], item: HeatmapItem) {
   }
 }
 
-function parseAnalysisVisualizations(content: string, activeSessionId: string | null): AnalysisVisualization[] {
+function parseAnalysisVisualizations(
+  content: string,
+  activeSessionId: string | null,
+  cacheKey?: string
+): AnalysisVisualization[] {
   const lines = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
   const transmilHeatmaps: HeatmapItem[] = [];
   const cmtaHeatmaps: HeatmapItem[] = [];
@@ -1488,12 +1500,12 @@ function parseAnalysisVisualizations(content: string, activeSessionId: string | 
         const label = inferTransmilHeatmapLabel(line, path, transmilHeatmaps.length);
         appendHeatmapItem(
           transmilHeatmaps,
-          createHeatmapItem(label, path, activeSessionId, transmilScoreModes[label])
+          createHeatmapItem(label, path, activeSessionId, transmilScoreModes[label], cacheKey)
         );
       } else if (combined.includes("cmta") || combined.includes("g_in_p") || combined.includes("omic")) {
         appendHeatmapItem(
           cmtaHeatmaps,
-          createHeatmapItem(inferCmtaHeatmapLabel(path, cmtaHeatmaps.length), path, activeSessionId)
+          createHeatmapItem(inferCmtaHeatmapLabel(path, cmtaHeatmaps.length), path, activeSessionId, undefined, cacheKey)
         );
       }
     });
@@ -2472,7 +2484,8 @@ export default function App() {
     const parsed = new Map<number, AnalysisVisualization[]>();
     messages.forEach((message) => {
       if (message.role !== "assistant") return;
-      const visualizations = parseAnalysisVisualizations(message.content, sessionId);
+      const cacheKey = `${message.id}-${message.content.length}-${Date.now()}`;
+      const visualizations = parseAnalysisVisualizations(message.content, sessionId, cacheKey);
       if (visualizations.length) parsed.set(message.id, visualizations);
     });
     return parsed;

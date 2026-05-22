@@ -839,7 +839,10 @@ def get_file(session_id: str, relative_path: str):
         raise HTTPException(status_code=403, detail="Forbidden path")
     if not target.is_file():
         raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(target)
+    response = FileResponse(target)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response
 
 
 if __name__ == "__main__":

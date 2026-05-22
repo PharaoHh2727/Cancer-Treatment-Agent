@@ -1034,7 +1034,10 @@ def predict_tnm_stage(features_input: str, cancer_type: str = "BRCA") -> str:
         loaded_features = torch.load(features_path, map_location=transmil.device, weights_only=False)
         features = _unwrap_feature_tensor(loaded_features)
         print(f"[Pathomics特征] features shape: {features.shape if hasattr(features, 'shape') else type(features)}")
-        coords, patch_size, coords_path = _load_clam_h5_coords(features_path)
+        clam_context = _load_clam_visualization_context(features_path)
+        coords = clam_context["coords"]
+        patch_size = clam_context["patch_size"]
+        coords_path = clam_context["coords_path"]
         n_original_patches = None
         if hasattr(features, "shape") and len(features.shape) >= 2:
             n_original_patches = int(features.shape[1]) if len(features.shape) == 3 and int(features.shape[0]) == 1 else int(features.shape[0])
@@ -1051,6 +1054,8 @@ def predict_tnm_stage(features_input: str, cancer_type: str = "BRCA") -> str:
             return_attention=True,
             pathomics_coords=coords,
             pathomics_patch_size=patch_size,
+            pathomics_background_path=clam_context["background_path"],
+            pathomics_level_dim=clam_context["level_dim"],
             attention_output_dir=str(attention_output_dir),
             slide_id=features_path.stem,
         )
@@ -1114,52 +1119,141 @@ def _unwrap_feature_tensor(loaded: Any) -> Any:
                 return loaded[key]
     return loaded
 
-def _find_clam_h5_coords_path(features_path: Path) -> Path | None:
-    stem = features_path.stem
-    candidates = [
-        features_path.parent.parent / "h5_files" / f"{stem}.h5",
-        features_path.parent.parent.parent / "clam_output" / "patches" / f"{stem}.h5",
-        features_path.with_suffix(".h5"),
-    ]
-    seen = set()
-    for candidate in candidates:
-        try:
-            key = str(candidate.resolve())
-        except Exception:
-            key = str(candidate)
-        if key in seen:
+def _coerce_h5_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(np.asarray(value).reshape(-1)[0])
+    except Exception:
+        return None
+
+
+def _coerce_h5_level_dim(value: Any) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    try:
+        array = np.asarray(value).reshape(-1)
+        if array.size < 2:
+            return None
+        width = int(array[0])
+        height = int(array[1])
+        if width <= 0 or height <= 0:
+            return None
+        return width, height
+    except Exception:
+        return None
+
+
+def _attrs_first_int(*attrs_maps: Any, keys: tuple[str, ...]) -> int | None:
+    for attrs in attrs_maps:
+        if attrs is None:
             continue
-        seen.add(key)
-        if candidate.exists():
-            return candidate
+        for key in keys:
+            value = attrs.get(key) if hasattr(attrs, "get") else None
+            coerced = _coerce_h5_int(value)
+            if coerced is not None:
+                return coerced
     return None
 
-def _load_clam_h5_coords(features_path: Path) -> tuple[np.ndarray | None, int | None, str | None]:
-    h5_path = _find_clam_h5_coords_path(features_path)
-    if h5_path is None:
-        print(f"  [CMTA attention] CLAM h5 coords not found for {features_path}")
-        return None, None, None
+
+def _attrs_first_level_dim(*attrs_maps: Any, keys: tuple[str, ...]) -> tuple[int, int] | None:
+    for attrs in attrs_maps:
+        if attrs is None:
+            continue
+        for key in keys:
+            value = attrs.get(key) if hasattr(attrs, "get") else None
+            coerced = _coerce_h5_level_dim(value)
+            if coerced is not None:
+                return coerced
+    return None
+
+
+def _find_clam_mask_background_path(features_path: Path) -> str | None:
+    session_root = features_path.parent.parent.parent
+    mask_dir = session_root / "clam_output" / "masks"
+    for suffix in (".jpg", ".jpeg", ".png"):
+        candidate = mask_dir / f"{features_path.stem}{suffix}"
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _load_clam_patch_metadata(patch_h5_path: Path) -> tuple[int | None, tuple[int, int] | None]:
+    if not patch_h5_path.exists():
+        return None, None
+    try:
+        import h5py
+
+        with h5py.File(patch_h5_path, "r") as handle:
+            coords_attrs = handle["coords"].attrs if "coords" in handle else None
+            patch_size = _attrs_first_int(
+                coords_attrs,
+                handle.attrs,
+                keys=("patch_size", "patch_size_level0"),
+            )
+            level_dim = _attrs_first_level_dim(
+                coords_attrs,
+                handle.attrs,
+                keys=("level_dim", "downsampled_level_dim"),
+            )
+            return patch_size, level_dim
+    except Exception as exc:
+        print(f"  [CLAM visualization] Failed to load CLAM patch metadata from {patch_h5_path}: {exc}")
+        return None, None
+
+
+def _load_clam_feature_coords(h5_path: Path) -> tuple[np.ndarray | None, int | None, tuple[int, int] | None, str | None]:
+    if not h5_path.exists():
+        print(f"  [CLAM visualization] CLAM feature h5 coords not found: {h5_path}")
+        return None, None, None, None
 
     try:
         import h5py
 
         with h5py.File(h5_path, "r") as handle:
             if "coords" not in handle:
-                print(f"  [CMTA attention] coords dataset not found in {h5_path}")
-                return None, None, str(h5_path)
+                print(f"  [CLAM visualization] coords dataset not found in {h5_path}")
+                return None, None, None, str(h5_path)
 
             coords_dataset = handle["coords"]
             coords = np.asarray(coords_dataset)
-            patch_size = coords_dataset.attrs.get("patch_size")
-            if patch_size is None:
-                patch_size = handle.attrs.get("patch_size")
-            if patch_size is None:
-                patch_size = handle.attrs.get("patch_size_level0")
-            patch_size = int(np.asarray(patch_size).reshape(-1)[0]) if patch_size is not None else None
-            return coords, patch_size, str(h5_path)
+            patch_size = _attrs_first_int(
+                coords_dataset.attrs,
+                handle.attrs,
+                keys=("patch_size", "patch_size_level0"),
+            )
+            level_dim = _attrs_first_level_dim(
+                coords_dataset.attrs,
+                handle.attrs,
+                keys=("level_dim", "downsampled_level_dim"),
+            )
+            return coords, patch_size, level_dim, str(h5_path)
     except Exception as exc:
-        print(f"  [CMTA attention] Failed to load CLAM h5 coords from {h5_path}: {exc}")
-        return None, None, str(h5_path)
+        print(f"  [CLAM visualization] Failed to load CLAM h5 coords from {h5_path}: {exc}")
+        return None, None, None, str(h5_path)
+
+
+def _load_clam_visualization_context(features_path: Path) -> dict[str, Any]:
+    features_path = Path(features_path)
+    clam_features_dir = features_path.parent.parent
+    session_root = clam_features_dir.parent
+    coords_h5_path = clam_features_dir / "h5_files" / f"{features_path.stem}.h5"
+    patch_h5_path = session_root / "clam_output" / "patches" / f"{features_path.stem}.h5"
+
+    coords, patch_size, level_dim, coords_path = _load_clam_feature_coords(coords_h5_path)
+    patch_metadata_size, patch_metadata_level_dim = _load_clam_patch_metadata(patch_h5_path)
+    if patch_size is None:
+        patch_size = patch_metadata_size
+    if level_dim is None:
+        level_dim = patch_metadata_level_dim
+
+    return {
+        "coords": coords,
+        "patch_size": patch_size,
+        "coords_path": coords_path,
+        "background_path": _find_clam_mask_background_path(features_path),
+        "level_dim": level_dim,
+    }
 
 
 @tool
@@ -1192,7 +1286,10 @@ def predict_survival(features_input: str, gene_input: str, cancer_type: str = "B
 
         features = _unwrap_feature_tensor(torch.load(features_path, map_location=cmta.device, weights_only=False))
         print(f"[Pathomics特征] features shape: {features.shape if hasattr(features, 'shape') else type(features)}")
-        coords, patch_size, coords_path = _load_clam_h5_coords(features_path)
+        clam_context = _load_clam_visualization_context(features_path)
+        coords = clam_context["coords"]
+        patch_size = clam_context["patch_size"]
+        coords_path = clam_context["coords_path"]
         n_original_patches = int(features.shape[0])
         if coords is not None and coords.shape[0] != n_original_patches:
             print(
@@ -1216,6 +1313,8 @@ def predict_survival(features_input: str, gene_input: str, cancer_type: str = "B
             return_attention=True,
             pathomics_coords=coords,
             pathomics_patch_size=patch_size,
+            pathomics_background_path=clam_context["background_path"],
+            pathomics_level_dim=clam_context["level_dim"],
             attention_output_dir=str(attention_output_dir),
         )
         
